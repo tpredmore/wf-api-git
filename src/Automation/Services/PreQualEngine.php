@@ -8,6 +8,7 @@ use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\NotFoundExceptionInterface;
 use WF\API\Automation\Contracts\PreQualEngineInterface;
 use WF\API\Automation\Contracts\RiskScorerInterface;
+use WF\API\Automation\Exceptions\ValuationException;
 use WF\API\Automation\Factories\BureauClientFactory;
 use WF\API\Automation\Factories\CreditParserFactory;
 use WF\API\Automation\Factories\ValuationProviderFactory;
@@ -29,7 +30,7 @@ class PreQualEngine implements PreQualEngineInterface
     ) {}
 
     /**
-     * @throws \WF\API\Automation\Exceptions\AutomationException
+     * @throws AutomationException
      */
     public function evaluate(Applicant $applicant, Vehicle $vehicle, array $additionalData = []): PreQualResult
     {
@@ -40,15 +41,21 @@ class PreQualEngine implements PreQualEngineInterface
         $providedCreditProfile = $additionalData['credit_profile'] ?? null;
         $providedValuation = $additionalData['vehicle_valuation'] ?? null;
 
+        // Track if we used cache
+        $fromCache = false;
+
         try {
             // Step 1: Get credit profile (from provided data, cache, or bureau)
-            $creditProfile = $this->getCreditProfile(
+            $result = $this->getCreditProfile(
               $applicant,
               $bureau,
               $useCache,
               $skipBureauPull,
               $providedCreditProfile
             );
+
+            $creditProfile = $result['profile'];
+            $fromCache = $result['from_cache'];
 
             // Step 2: Get vehicle with valuation
             $vehicleWithValue = $this->getVehicleWithValuation(
@@ -79,7 +86,7 @@ class PreQualEngine implements PreQualEngineInterface
                 'bureau_used' => $bureau,
                 'score_factors' => $this->riskScorer->getScoreFactors(),
                 'processing_time' => microtime(true) - ($_SERVER['REQUEST_TIME_FLOAT'] ?? 0),
-                'from_cache' => isset($additionalData['_from_cache']) && $additionalData['_from_cache'],
+                'from_cache' => $fromCache,
                 'skipped_bureau_pull' => $skipBureauPull,
                 'skipped_valuation' => $skipValuation
               ]
@@ -93,8 +100,9 @@ class PreQualEngine implements PreQualEngineInterface
 
     /**
      * Get credit profile from provided data, cache, or bureau
+     * Returns array with profile and cache flag
      *
-     * @throws \WF\API\Automation\Exceptions\AutomationException
+     * @throws AutomationException
      */
     private function getCreditProfile(
       Applicant $applicant,
@@ -102,18 +110,21 @@ class PreQualEngine implements PreQualEngineInterface
       bool $useCache,
       bool $skipBureauPull,
       ?array $providedCreditProfile
-    ): CreditProfile {
+    ): array {
         // Option 1: Use provided credit profile data
         if ($providedCreditProfile !== null) {
             Log::info("Using provided credit profile data");
 
             // If it's already a CreditProfile object
             if ($providedCreditProfile instanceof CreditProfile) {
-                return $providedCreditProfile;
+                return ['profile' => $providedCreditProfile, 'from_cache' => false];
             }
 
             // If it's an array, convert to CreditProfile
-            return CreditProfile::fromArray($providedCreditProfile);
+            return [
+              'profile' => CreditProfile::fromArray($providedCreditProfile),
+              'from_cache' => false
+            ];
         }
 
         // Option 2: Check cache if enabled
@@ -121,15 +132,17 @@ class PreQualEngine implements PreQualEngineInterface
             $cachedProfile = $this->cacheService->get($applicant->ssn, $bureau);
             if ($cachedProfile !== null) {
                 Log::info("Using cached credit profile for bureau: $bureau");
-                $this->additionalData['_from_cache'] = true;
-                return $cachedProfile;
+                return ['profile' => $cachedProfile, 'from_cache' => true];
             }
         }
 
         // Option 3: Skip bureau pull if requested (return no-hit profile)
         if ($skipBureauPull) {
             Log::info("Skipping bureau pull, returning no-hit profile");
-            return $this->createNoHitProfile($bureau);
+            return [
+              'profile' => $this->createNoHitProfile($bureau),
+              'from_cache' => false
+            ];
         }
 
         // Option 4: Pull from bureau
@@ -140,11 +153,14 @@ class PreQualEngine implements PreQualEngineInterface
             $this->cacheService->set($applicant->ssn, $bureau, $creditProfile);
         }
 
-        return $creditProfile;
+        return ['profile' => $creditProfile, 'from_cache' => false];
     }
 
     /**
      * Get vehicle with valuation
+     *
+     * @throws ValuationException
+     * @throws \WF\API\Automation\Exceptions\ValidationException
      */
     private function getVehicleWithValuation(
       Vehicle $vehicle,
@@ -222,11 +238,10 @@ class PreQualEngine implements PreQualEngineInterface
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\AutomationException
+     * @throws AutomationException
      */
     private function pullCreditReport(Applicant $applicant, string $bureau): CreditProfile
     {
-
         try {
             $client = $this->bureauFactory->create($bureau);
         } catch (NotFoundExceptionInterface|ContainerExceptionInterface|AutomationException $e) {
@@ -236,11 +251,17 @@ class PreQualEngine implements PreQualEngineInterface
 
         $parser = $this->parserFactory->create($bureau);
 
+        // Add middleName property to Applicant model or handle it here
+        $middleName = '';
+        if (property_exists($applicant, 'middleName')) {
+            $middleName = $applicant->middleName;
+        }
+
         $consumers = [
           [
             'firstName' => $applicant->firstName,
             'lastName' => $applicant->lastName,
-            'middleName' => $applicant->middleName ?? '',
+            'middleName' => $middleName,
             'ssn' => $applicant->ssn,
             'address' => $applicant->address,
             'city' => $applicant->city,

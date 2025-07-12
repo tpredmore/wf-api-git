@@ -13,17 +13,23 @@ use Log;
 class ValuationController
 {
     public function __construct(
-      private ValuationProviderFactory $valuationFactory,
-      private Log $logger
-    ) {}
+      private ValuationProviderFactory $valuationFactory
+    ) { }
 
     /**
      * Handle VIN-based valuation (legacy compatible)
      */
-    public function handleVinValuation(array $requestData, array $params): array
+    public function handleVinValuation($requestData, array $params): array
     {
         try {
-            $nadaData = $requestData['nada'] ?? [];
+            // Handle both object and array request formats
+            if (is_object($requestData) && property_exists($requestData, 'data')) {
+                $data = json_decode($requestData->data, true);
+            } else {
+                $data = $requestData;
+            }
+
+            $nadaData = $data['nada'] ?? [];
 
             // Validate required fields
             $this->validateVinRequest($nadaData);
@@ -31,6 +37,12 @@ class ValuationController
             $vin = trim(strtoupper($nadaData['VIN'] ?? $nadaData['vin']));
             $state = trim(strtoupper($nadaData['state']));
             $mileage = (int)trim($nadaData['mileage']);
+
+            Log::info("Processing VIN valuation request", [
+              'vin' => substr($vin, 0, 8) . '...',
+              'state' => $state,
+              'mileage' => $mileage
+            ]);
 
             // Get NADA provider
             $provider = $this->valuationFactory->create('nada');
@@ -41,6 +53,11 @@ class ValuationController
             // Perform valuation
             $data = $provider->getValuationByVin($vin, $mileage, $state);
 
+            Log::info("VIN valuation successful", json_encode([
+              'retail_value' => $data['vehicle_retail_value'] ?? 0,
+              'trade_value' => $data['vehicle_trade_value'] ?? 0
+            ]));
+
             return [
               'success' => true,
               'error' => '',
@@ -48,17 +65,14 @@ class ValuationController
             ];
 
         } catch (ValidationException $e) {
+            Log::warn("VIN valuation validation failed: " . $e->getMessage());
             return [
               'success' => false,
               'error' => $e->getMessage(),
               'data' => []
             ];
         } catch (\Throwable $e) {
-            $this->logger->error('VIN valuation failed', print_r([
-              'error' => $e->getMessage(),
-              'trace' => $e->getTraceAsString()
-            ],true));
-
+            Log::error("VIN valuation failed: " . $e->getMessage() . "\n" . $e->getTraceAsString());
             return [
               'success' => false,
               'error' => 'Internal server error',
@@ -70,10 +84,17 @@ class ValuationController
     /**
      * Handle Year/Make/Model valuation (legacy compatible)
      */
-    public function handleYmmValuation(array $requestData, array $params): array
+    public function handleYmmValuation($requestData, array $params): array
     {
         try {
-            $nadaData = $requestData['nada'] ?? [];
+            // Handle both object and array request formats
+            if (is_object($requestData) && property_exists($requestData, 'data')) {
+                $data = json_decode($requestData->data, true);
+            } else {
+                $data = $requestData;
+            }
+
+            $nadaData = $data['nada'] ?? [];
 
             // Validate required fields
             $this->validateYmmRequest($nadaData);
@@ -85,6 +106,15 @@ class ValuationController
             $state = trim(strtoupper($nadaData['state']));
             $mileage = (int)trim($nadaData['mileage']);
 
+            Log::info("Processing YMM valuation request", [
+              'year' => $year,
+              'make' => $make,
+              'model' => $model,
+              'trim' => $trim,
+              'state' => $state,
+              'mileage' => $mileage
+            ]);
+
             // Get NADA provider
             $provider = $this->valuationFactory->create('nada');
             if (!($provider instanceof NADAProvider)) {
@@ -94,6 +124,11 @@ class ValuationController
             // Perform valuation
             $data = $provider->getValuationByYMM($year, $make, $model, $trim, $state, $mileage);
 
+            Log::info("YMM valuation successful", [
+              'retail_value' => $data['vehicle_retail_value'] ?? 0,
+              'trade_value' => $data['vehicle_trade_value'] ?? 0
+            ]);
+
             return [
               'success' => true,
               'error' => '',
@@ -101,17 +136,14 @@ class ValuationController
             ];
 
         } catch (ValidationException $e) {
+            Log::warn("YMM valuation validation failed: " . $e->getMessage());
             return [
               'success' => false,
               'error' => $e->getMessage(),
               'data' => []
             ];
         } catch (\Throwable $e) {
-            $this->logger->error('YMM valuation failed', print_r([
-              'error' => $e->getMessage(),
-              'trace' => $e->getTraceAsString()
-            ],true));
-
+            Log::error("YMM valuation failed: " . $e->getMessage() . "\n" . $e->getTraceAsString());
             return [
               'success' => false,
               'error' => 'Internal server error',
@@ -123,14 +155,21 @@ class ValuationController
     /**
      * Modern valuation endpoint
      */
-    public function getValuation(array $requestData, array $params): array
+    public function getValuation($requestData, array $params): array
     {
         try {
-            $vin = $requestData['vin'] ?? '';
-            $mileage = (int)($requestData['mileage'] ?? 0);
-            $zipCode = $requestData['zip_code'] ?? '';
-            $condition = $requestData['condition'] ?? 'good';
-            $provider = $requestData['provider'] ?? 'nada';
+            // Handle both object and array request formats
+            if (is_object($requestData) && property_exists($requestData, 'data')) {
+                $data = json_decode($requestData->data, true);
+            } else {
+                $data = $requestData;
+            }
+
+            $vin = $data['vin'] ?? '';
+            $mileage = (int)($data['mileage'] ?? 0);
+            $zipCode = $data['zip_code'] ?? '';
+            $condition = $data['condition'] ?? 'good';
+            $provider = $data['provider'] ?? 'nada';
 
             if (empty($vin)) {
                 throw new ValidationException('VIN is required');
@@ -140,34 +179,46 @@ class ValuationController
                 throw new ValidationException('Valid mileage is required');
             }
 
+            Log::info("Processing modern valuation request", json_encode([
+              'vin' => substr($vin, 0, 8) . '...',
+              'mileage' => $mileage,
+              'provider' => $provider
+            ]));
+
             // Get valuation
             $valuationProvider = $this->valuationFactory->create($provider);
             $result = $valuationProvider->getValuation($vin, $mileage, $zipCode, $condition);
 
+            Log::info("Modern valuation successful", json_encode([
+              'provider' => $provider,
+              'value' => $result['value'] ?? 0
+            ]));
+
             return [
               'success' => true,
-              'data' => $result
+              'data' => $result,
+              'error' => ''
             ];
 
         } catch (ValidationException $e) {
+            Log::warn("Modern valuation validation failed: " . $e->getMessage());
             return [
               'success' => false,
-              'error' => $e->getMessage()
+              'error' => $e->getMessage(),
+              'data' => []
             ];
         } catch (\Throwable $e) {
-            $this->logger->error('Modern valuation failed', [
-              'error' => $e->getMessage()
-            ]);
-
+            Log::error("Modern valuation failed: " . $e->getMessage());
             return [
               'success' => false,
-              'error' => 'Valuation service error'
+              'error' => 'Valuation service error',
+              'data' => []
             ];
         }
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValidationException
+     * @throws ValidationException
      */
     private function validateVinRequest(array $data): void
     {
@@ -193,6 +244,9 @@ class ValuationController
         }
     }
 
+    /**
+     * @throws ValidationException
+     */
     private function validateYmmRequest(array $data): void
     {
         if (!isset($data['year'])) {

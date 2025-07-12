@@ -12,14 +12,16 @@ class NADAProvider extends AbstractValuationProvider
 {
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     protected function makeValuationRequest(string $vin, int $mileage, string $zipCode, string $condition): array
     {
         try {
             // If VIN is provided and valid, use VIN lookup
             if (!empty($vin) && strlen($vin) === 17) {
-                return $this->getValuationByVin($vin, $mileage, $zipCode);
+                // Convert zip code to state for NADA
+                $state = $this->getStateFromZip($zipCode);
+                return $this->getValuationByVin($vin, $mileage, $state);
             }
 
             throw new ValuationException('VIN required for NADA valuation');
@@ -61,7 +63,7 @@ class NADAProvider extends AbstractValuationProvider
     /**
      * Get valuation by VIN (legacy compatible)
      *
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     public function getValuationByVin(string $vin, int $mileage, string $state): array
     {
@@ -97,10 +99,10 @@ class NADAProvider extends AbstractValuationProvider
             return array_merge($vehicleData, $valuationData, $accessoryData);
 
         } catch (\Throwable $e) {
-            $this->logger->error('NADA VIN lookup failed', print_r([
+            Log::error('NADA VIN lookup failed', [
               'vin' => substr($vin, 0, 8) . '...',
               'error' => $e->getMessage()
-            ],true));
+            ]);
             throw new ValuationException('NADA Error: ' . $e->getMessage(), 0, $e);
         }
     }
@@ -108,7 +110,7 @@ class NADAProvider extends AbstractValuationProvider
     /**
      * Get valuation by Year/Make/Model (legacy compatible)
      *
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     public function getValuationByYMM(int $year, string $make, string $model, ?string $trim, string $state, int $mileage): array
     {
@@ -167,16 +169,16 @@ class NADAProvider extends AbstractValuationProvider
             return array_merge($vehicleData, $valuationData, $accessoryData);
 
         } catch (\Throwable $e) {
-            $this->logger->error('NADA YMM lookup failed', print_r([
+            Log::error('NADA YMM lookup failed', [
               'ymm' => "{$year} {$make} {$model}",
               'error' => $e->getMessage()
-            ],true));
+            ]);
             throw new ValuationException('NADA Error: ' . $e->getMessage(), 0, $e);
         }
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function fetchVehiclesByVin(string $vin): array
     {
@@ -233,7 +235,7 @@ class NADAProvider extends AbstractValuationProvider
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function getRegionIdByState(string $state): int
     {
@@ -274,7 +276,7 @@ class NADAProvider extends AbstractValuationProvider
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function fetchValuationData(string $ucgvehicleid, int $regionId, int $mileage): array
     {
@@ -336,7 +338,7 @@ class NADAProvider extends AbstractValuationProvider
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function fetchAccessoryData(string $ucgvehicleid, int $regionId, int $mileage, ?string $vin = null): array
     {
@@ -399,7 +401,7 @@ class NADAProvider extends AbstractValuationProvider
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function fetchTrimsForYMM(int $year, string $make, string $model): array
     {
@@ -440,7 +442,7 @@ class NADAProvider extends AbstractValuationProvider
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
+     * @throws ValuationException
      */
     private function selectBestTrim(array $trimData, ?string $requestedTrim): array
     {
@@ -477,5 +479,28 @@ class NADAProvider extends AbstractValuationProvider
         ];
 
         return in_array(strtoupper($state), $validStates);
+    }
+
+    /**
+     * Simple zip to state mapping (you'd want a more complete solution)
+     */
+    private function getStateFromZip(string $zipCode): string
+    {
+        // This is a simplified example - you'd want a complete mapping
+        $firstDigit = substr($zipCode, 0, 1);
+
+        return match($firstDigit) {
+            '0' => 'MA', // Northeast
+            '1' => 'NY',
+            '2' => 'DC',
+            '3' => 'GA',
+            '4' => 'IN',
+            '5' => 'IA',
+            '6' => 'IL',
+            '7' => 'TX',
+            '8' => 'CO',
+            '9' => 'CA',
+            default => 'TX' // Default
+        };
     }
 }

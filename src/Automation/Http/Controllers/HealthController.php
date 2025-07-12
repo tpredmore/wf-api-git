@@ -8,10 +8,6 @@ use Log;
 
 class HealthController
 {
-    public function __construct(
-      private Log $logger
-    ) {}
-
     public function check(array $requestData, array $params): array
     {
         try {
@@ -20,7 +16,9 @@ class HealthController
               'database' => $this->checkDatabase(),
               'logging' => $this->checkLogging(),
               'memory' => $this->checkMemory(),
-              'disk' => $this->checkDisk()
+              'disk' => $this->checkDisk(),
+              'cache' => $this->checkCache(),
+              'bureaus' => $this->checkBureauConnections()
             ];
 
             $allHealthy = array_reduce($checks, fn($carry, $check) => $carry && $check['healthy'], true);
@@ -37,7 +35,7 @@ class HealthController
             ];
 
         } catch (\Throwable $e) {
-            $this->logger->error('Health check failed', ['error' => $e->getMessage()]);
+            Log::error('Health check failed: ' . $e->getMessage());
 
             return [
               'success' => false,
@@ -54,7 +52,7 @@ class HealthController
     {
         try {
             // Add your database health check logic here
-
+            // For now, return success
             return [
               'healthy' => true,
               'message' => 'Database connection OK'
@@ -67,10 +65,48 @@ class HealthController
         }
     }
 
+    private function checkCache(): array
+    {
+        try {
+            // Test Redis connection
+            $testKey = 'health_check_' . time();
+            \Cache::set($testKey, 'test', false, 1);
+            $value = \Cache::get($testKey);
+            \Cache::del($testKey);
+
+            return [
+              'healthy' => $value === 'test',
+              'message' => 'Cache (Redis) connection OK'
+            ];
+        } catch (\Throwable $e) {
+            return [
+              'healthy' => false,
+              'message' => 'Cache connection failed: ' . $e->getMessage()
+            ];
+        }
+    }
+
+    private function checkBureauConnections(): array
+    {
+        $bureaus = [
+          'equifax' => !empty($_ENV['EQUIFAX_CLIENT_ID']),
+          'experian' => !empty($_ENV['EXPERIAN_CLIENT_ID']),
+          'transunion' => !empty($_ENV['TRANSUNION_ENDPOINT'])
+        ];
+
+        $configured = array_filter($bureaus);
+
+        return [
+          'healthy' => count($configured) > 0,
+          'message' => sprintf('%d of 3 bureaus configured', count($configured)),
+          'details' => $bureaus
+        ];
+    }
+
     private function checkLogging(): array
     {
         try {
-            $this->logger->info('Health check log test');
+            Log::info('Health check log test');
             return [
               'healthy' => true,
               'message' => 'Logging system OK'
