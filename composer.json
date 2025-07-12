@@ -1,0 +1,24 @@
+{
+  "name": "gravity-lending/wf-api",
+  "description": "The Official WildFire API",
+  "type": "application",
+  "keywords": ["api", "http", "rest", "wildfire", "LOS", "gravity", "gravitylending"],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Gravity Lending",
+      "email": "development@gravitylending.com"
+    }
+  ],
+  "homepage": "https://gravitylending.com",
+  "require": {
+    "php": ">=8.1",
+    "php-di/php-di": "^7.0"
+  },
+
+  "autoload": {
+    "psr-4": {
+      "WF\\API\\": "src/"
+    }
+  }
+}
