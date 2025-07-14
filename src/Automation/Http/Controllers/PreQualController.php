@@ -13,7 +13,7 @@ class PreQualController
 {
     public function __construct(
       private AutomationService $automationService
-    ) { }
+    ) {}
 
     public function handlePreQual($request, array $params = []): array
     {

@@ -14,7 +14,7 @@ class ValuationController
 {
     public function __construct(
       private ValuationProviderFactory $valuationFactory
-    ) { }
+    ) {}
 
     /**
      * Handle VIN-based valuation (legacy compatible)
@@ -38,11 +38,11 @@ class ValuationController
             $state = trim(strtoupper($nadaData['state']));
             $mileage = (int)trim($nadaData['mileage']);
 
-            Log::info("Processing VIN valuation request", [
+            Log::info("Processing VIN valuation request", json_encode([
               'vin' => substr($vin, 0, 8) . '...',
               'state' => $state,
               'mileage' => $mileage
-            ]);
+            ]));
 
             // Get NADA provider
             $provider = $this->valuationFactory->create('nada');
@@ -106,14 +106,14 @@ class ValuationController
             $state = trim(strtoupper($nadaData['state']));
             $mileage = (int)trim($nadaData['mileage']);
 
-            Log::info("Processing YMM valuation request", [
+            Log::info("Processing YMM valuation request", json_encode([
               'year' => $year,
               'make' => $make,
               'model' => $model,
               'trim' => $trim,
               'state' => $state,
               'mileage' => $mileage
-            ]);
+            ]));
 
             // Get NADA provider
             $provider = $this->valuationFactory->create('nada');
@@ -124,10 +124,10 @@ class ValuationController
             // Perform valuation
             $data = $provider->getValuationByYMM($year, $make, $model, $trim, $state, $mileage);
 
-            Log::info("YMM valuation successful", [
+            Log::info("YMM valuation successful", json_encode([
               'retail_value' => $data['vehicle_retail_value'] ?? 0,
               'trade_value' => $data['vehicle_trade_value'] ?? 0
-            ]);
+            ]));
 
             return [
               'success' => true,

@@ -71,9 +71,6 @@ class Applicant
         ];
     }
 
-    /**
-     * @throws \WF\API\Automation\Exceptions\ValidationException
-     */
     private function validate(): void
     {
         if ($this->monthlyIncome < 0) {

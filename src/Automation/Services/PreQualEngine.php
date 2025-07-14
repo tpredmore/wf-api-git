@@ -8,7 +8,6 @@ use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\NotFoundExceptionInterface;
 use WF\API\Automation\Contracts\PreQualEngineInterface;
 use WF\API\Automation\Contracts\RiskScorerInterface;
-use WF\API\Automation\Exceptions\ValuationException;
 use WF\API\Automation\Factories\BureauClientFactory;
 use WF\API\Automation\Factories\CreditParserFactory;
 use WF\API\Automation\Factories\ValuationProviderFactory;
@@ -44,22 +43,8 @@ class PreQualEngine implements PreQualEngineInterface
         // Track if we used cache
         $fromCache = false;
 
-        // Add initial breadcrumb
-        RequestLogger::addBreadcrumb('PreQual evaluation started', [
-          'bureau' => $bureau,
-          'use_cache' => $useCache,
-          'skip_bureau' => $skipBureauPull,
-          'skip_valuation' => $skipValuation
-        ], 'PreQualEngine');
-
         try {
             // Step 1: Get credit profile (from provided data, cache, or bureau)
-            RequestLogger::addBreadcrumb('Getting credit profile', [
-              'has_provided' => $providedCreditProfile !== null,
-              'ssn_provided' => !empty($applicant->ssn)
-            ], 'PreQualEngine');
-
-            $startCredit = microtime(true);
             $result = $this->getCreditProfile(
               $applicant,
               $bureau,
@@ -71,76 +56,21 @@ class PreQualEngine implements PreQualEngineInterface
             $creditProfile = $result['profile'];
             $fromCache = $result['from_cache'];
 
-            RequestLogger::addMetric('credit_profile.duration', (microtime(true) - $startCredit) * 1000, [
-              'bureau' => $bureau,
-              'from_cache' => $fromCache ? 'true' : 'false'
-            ]);
-
-            RequestLogger::addBreadcrumb('Credit profile obtained', [
-              'has_score' => $creditProfile->hasValidScore(),
-              'fico_score' => $creditProfile->ficoScore ?? 'N/A',
-              'from_cache' => $fromCache
-            ], 'PreQualEngine');
-
             // Step 2: Get vehicle with valuation
-            RequestLogger::addBreadcrumb('Getting vehicle valuation', [
-              'has_existing_value' => $vehicle->vehicleValue !== null,
-              'skip_valuation' => $skipValuation
-            ], 'PreQualEngine');
-
-            $startValuation = microtime(true);
             $vehicleWithValue = $this->getVehicleWithValuation(
               $vehicle,
               $skipValuation,
               $providedValuation
             );
 
-            RequestLogger::addMetric('vehicle_valuation.duration', (microtime(true) - $startValuation) * 1000);
-
-            RequestLogger::addBreadcrumb('Vehicle valuation complete', [
-              'value' => $vehicleWithValue->vehicleValue ?? 0,
-              'ltv' => $vehicleWithValue->calculateLTV()
-            ], 'PreQualEngine');
-
             // Step 3: Calculate risk score and match lenders
-            RequestLogger::addBreadcrumb('Calculating risk score', [], 'PreQualEngine');
-
-            $startScoring = microtime(true);
             $riskScore = $this->riskScorer->calculateScore($applicant, $vehicleWithValue, $creditProfile);
             $riskTier = $this->riskScorer->getRiskTier($riskScore);
-
-            RequestLogger::addMetric('risk_scoring.duration', (microtime(true) - $startScoring) * 1000);
-            RequestLogger::addMetric('risk_score', $riskScore, ['tier' => $riskTier]);
-
-            RequestLogger::addBreadcrumb('Risk scoring complete', [
-              'score' => $riskScore,
-              'tier' => $riskTier
-            ], 'PreQualEngine');
-
-            // Match lenders
-            RequestLogger::addBreadcrumb('Matching lenders', [], 'PreQualEngine');
-
-            $startMatching = microtime(true);
             $matchedLenders = $this->matchLenders($applicant, $vehicleWithValue, $creditProfile);
-
-            RequestLogger::addMetric('lender_matching.duration', (microtime(true) - $startMatching) * 1000);
-            RequestLogger::addMetric('matched_lenders.count', count($matchedLenders));
 
             // Step 4: Determine completeness
             $isComplete = $this->isResultComplete($creditProfile, $applicant, $vehicleWithValue);
             $missingReason = $isComplete ? null : $this->getMissingReason($creditProfile, $applicant, $vehicleWithValue);
-
-            RequestLogger::addBreadcrumb('PreQual evaluation complete', [
-              'is_complete' => $isComplete,
-              'missing_reason' => $missingReason,
-              'matched_lenders' => count($matchedLenders)
-            ], 'PreQualEngine');
-
-            // Calculate DTI for result
-            $dti = $applicant->calculateDTI($creditProfile->estimatedMonthlyDebt);
-
-            RequestLogger::addMetric('dti', $dti);
-            RequestLogger::addMetric('ltv', $vehicleWithValue->calculateLTV());
 
             return new PreQualResult(
               approvalScore: $isComplete ? $riskScore : 0.0,
@@ -150,7 +80,7 @@ class PreQualEngine implements PreQualEngineInterface
               missingReason: $missingReason,
               creditProfile: $creditProfile,
               ltv: $vehicleWithValue->calculateLTV(),
-              dti: $dti,
+              dti: $applicant->calculateDTI($creditProfile->estimatedMonthlyDebt),
               metadata: [
                 'bureau_used' => $bureau,
                 'score_factors' => $this->riskScorer->getScoreFactors(),
@@ -162,11 +92,6 @@ class PreQualEngine implements PreQualEngineInterface
             );
 
         } catch (\Throwable $e) {
-            RequestLogger::error('PreQual engine evaluation failed', [
-              'error' => $e->getMessage(),
-              'bureau' => $bureau
-            ]);
-
             Log::error("PreQual engine evaluation failed: " . $e->getMessage());
             throw new AutomationException('Failed to evaluate pre-qualification', 0, $e);
         }
@@ -187,7 +112,6 @@ class PreQualEngine implements PreQualEngineInterface
     ): array {
         // Option 1: Use provided credit profile data
         if ($providedCreditProfile !== null) {
-            RequestLogger::info('Using provided credit profile data');
             Log::info("Using provided credit profile data");
 
             // If it's already a CreditProfile object
@@ -204,23 +128,15 @@ class PreQualEngine implements PreQualEngineInterface
 
         // Option 2: Check cache if enabled
         if ($useCache && !empty($applicant->ssn)) {
-            RequestLogger::addBreadcrumb('Checking cache for credit profile', [
-              'bureau' => $bureau
-            ], 'PreQualEngine');
-
             $cachedProfile = $this->cacheService->get($applicant->ssn, $bureau);
             if ($cachedProfile !== null) {
-                RequestLogger::info('Cache hit for credit profile', ['bureau' => $bureau]);
                 Log::info("Using cached credit profile for bureau: $bureau");
                 return ['profile' => $cachedProfile, 'from_cache' => true];
             }
-
-            RequestLogger::info('Cache miss for credit profile', ['bureau' => $bureau]);
         }
 
         // Option 3: Skip bureau pull if requested (return no-hit profile)
         if ($skipBureauPull) {
-            RequestLogger::info('Skipping bureau pull per request');
             Log::info("Skipping bureau pull, returning no-hit profile");
             return [
               'profile' => $this->createNoHitProfile($bureau),
@@ -229,18 +145,10 @@ class PreQualEngine implements PreQualEngineInterface
         }
 
         // Option 4: Pull from bureau
-        RequestLogger::addBreadcrumb('Pulling credit report from bureau', [
-          'bureau' => $bureau
-        ], 'PreQualEngine');
-
         $creditProfile = $this->pullCreditReport($applicant, $bureau);
 
         // Cache the result if enabled
         if ($useCache && !empty($applicant->ssn) && $creditProfile->hasHit) {
-            RequestLogger::addBreadcrumb('Caching credit profile', [
-              'bureau' => $bureau
-            ], 'PreQualEngine');
-
             $this->cacheService->set($applicant->ssn, $bureau, $creditProfile);
         }
 
@@ -250,7 +158,6 @@ class PreQualEngine implements PreQualEngineInterface
     /**
      * Get vehicle with valuation
      *
-     * @throws ValuationException
      * @throws \WF\API\Automation\Exceptions\ValidationException
      */
     private function getVehicleWithValuation(
@@ -260,7 +167,6 @@ class PreQualEngine implements PreQualEngineInterface
     ): Vehicle {
         // If vehicle already has value, return as-is
         if ($vehicle->vehicleValue !== null && $vehicle->vehicleValue > 0) {
-            RequestLogger::info('Vehicle already has value', ['value' => $vehicle->vehicleValue]);
             return $vehicle;
         }
 
@@ -268,7 +174,6 @@ class PreQualEngine implements PreQualEngineInterface
         if ($providedValuation !== null) {
             $value = $providedValuation['value'] ?? $providedValuation['vehicle_value'] ?? 0;
             if ($value > 0) {
-                RequestLogger::info('Using provided vehicle valuation', ['value' => $value]);
                 Log::info("Using provided vehicle valuation: $value");
                 return new Vehicle(
                   vin: $vehicle->vin,
@@ -285,16 +190,11 @@ class PreQualEngine implements PreQualEngineInterface
 
         // If skipping valuation, return vehicle as-is
         if ($skipValuation) {
-            RequestLogger::info('Skipping vehicle valuation per request');
             Log::info("Skipping vehicle valuation");
             return $vehicle;
         }
 
         // Otherwise, get valuation from provider
-        RequestLogger::addBreadcrumb('Getting vehicle valuation from provider', [
-          'vin' => substr($vehicle->vin, 0, 8) . '...'
-        ], 'PreQualEngine');
-
         return $this->getVehicleValuation($vehicle);
     }
 
@@ -341,20 +241,8 @@ class PreQualEngine implements PreQualEngineInterface
     private function pullCreditReport(Applicant $applicant, string $bureau): CreditProfile
     {
         try {
-            $startPull = microtime(true);
             $client = $this->bureauFactory->create($bureau);
-
-            RequestLogger::addBreadcrumb('Bureau client created', [
-              'bureau' => $bureau,
-              'available' => $client->isAvailable()
-            ], 'PreQualEngine');
-
         } catch (NotFoundExceptionInterface|ContainerExceptionInterface|AutomationException $e) {
-            RequestLogger::error('Failed to create bureau client', [
-              'bureau' => $bureau,
-              'error' => $e->getMessage()
-            ]);
-
             Log::error("Loading bureau client factory failed: " . $e->getMessage());
             throw new AutomationException('Failed to loading bureau client factory', 0, $e);
         }
@@ -396,29 +284,8 @@ class PreQualEngine implements PreQualEngineInterface
             ];
         }
 
-        RequestLogger::addBreadcrumb('Calling bureau API', [
-          'bureau' => $bureau,
-          'consumer_count' => count($consumers)
-        ], 'PreQualEngine');
-
         $rawResponse = $client->pullCreditReport($consumers);
-
-        $pullDuration = (microtime(true) - $startPull) * 1000;
-        RequestLogger::addMetric('bureau_pull.duration', $pullDuration, [
-          'bureau' => $bureau,
-          'success' => 'true'
-        ]);
-
-        RequestLogger::addBreadcrumb('Parsing bureau response', [], 'PreQualEngine');
-
-        $startParse = microtime(true);
-        $profile = $parser->parse($rawResponse);
-
-        RequestLogger::addMetric('bureau_parse.duration', (microtime(true) - $startParse) * 1000, [
-          'bureau' => $bureau
-        ]);
-
-        return $profile;
+        return $parser->parse($rawResponse);
     }
 
     /**
@@ -427,16 +294,8 @@ class PreQualEngine implements PreQualEngineInterface
      */
     private function getVehicleValuation(Vehicle $vehicle): Vehicle
     {
-        $startValuation = microtime(true);
         $provider = $this->valuationFactory->createBest();
-
-        RequestLogger::info('Using valuation provider', ['provider' => $provider->getProviderName()]);
-
         $valuation = $provider->getValuation($vehicle->vin, $vehicle->mileage, '', $vehicle->condition);
-
-        RequestLogger::addMetric('valuation_provider.duration', (microtime(true) - $startValuation) * 1000, [
-          'provider' => $provider->getProviderName()
-        ]);
 
         return new Vehicle(
           vin: $vehicle->vin,

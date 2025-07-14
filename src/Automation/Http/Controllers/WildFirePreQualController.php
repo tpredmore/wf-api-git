@@ -10,7 +10,6 @@ use WF\API\Automation\Formatters\WildFireBureauFormatter;
 use WF\API\Automation\Models\Applicant;
 use WF\API\Automation\Exceptions\AutomationException;
 use WF\API\Automation\Exceptions\ValidationException;
-use WF\API\Automation\Services\RequestLogger;
 use Log;
 
 /**
@@ -30,33 +29,13 @@ class WildFirePreQualController
     public function handleWildFirePreQual($request): array
     {
         try {
-            // Add breadcrumb for controller entry
-            RequestLogger::addBreadcrumb('WildFire PreQual started', [], 'controller');
-
             // Parse the WildFire application payload
-            $startParse = microtime(true);
             $applicationData = $this->getApplicationPayload($request);
-            RequestLogger::addMetric('payload.parse.duration', (microtime(true) - $startParse) * 1000);
-
-            // Set context for this application
-            RequestLogger::setContext('application_id', $applicationData['application_id'] ?? 'unknown');
-            RequestLogger::setContext('has_coapplicant', isset($applicationData['co_applicant_active']) ? 'true' : 'false');
 
             // Extract applicant and vehicle data
-            RequestLogger::addBreadcrumb('Extracting applicant data', [
-              'has_ssn' => !empty($applicationData['applicant_ssn']),
-              'state' => $applicationData['applicant_state'] ?? 'unknown'
-            ], 'controller');
-
             $applicant = $this->payloadParser->parseApplicant($applicationData);
             $vehicle = $this->payloadParser->parseVehicle($applicationData);
             $preferredBureau = $this->payloadParser->extractBureauPreference($applicationData);
-
-            // Log decision about bureau selection
-            RequestLogger::info('Bureau selection', [
-              'requested' => $preferredBureau,
-              'validated' => $this->validateBureau($preferredBureau)
-            ]);
 
             // Validate bureau selection
             $preferredBureau = $this->validateBureau($preferredBureau);
@@ -72,27 +51,8 @@ class WildFirePreQualController
             // Extract optional processing flags and pre-populated data
             $this->extractOptionalData($applicationData, $requestData);
 
-            // Add breadcrumb before heavy processing
-            RequestLogger::addBreadcrumb('Starting automation processing', [
-              'bureau' => $preferredBureau,
-              'skip_bureau' => $requestData['skip_bureau_pull'] ?? false,
-              'skip_valuation' => $requestData['skip_valuation'] ?? false
-            ], 'controller');
-
             // Process through automation service
-            $startProcess = microtime(true);
             $result = $this->automationService->processPreQual($requestData);
-
-            $processDuration = (microtime(true) - $startProcess) * 1000;
-            RequestLogger::addMetric('automation.process.duration', $processDuration, [
-              'bureau' => $preferredBureau
-            ]);
-
-            // Add breadcrumb for formatting
-            RequestLogger::addBreadcrumb('Formatting response for WildFire', [
-              'has_credit_profile' => $result->creditProfile !== null,
-              'fico_score' => $result->creditProfile->ficoScore ?? 'N/A'
-            ], 'controller');
 
             // Format response in WildFire format
             $wildFireResponse = $this->wildFireFormatter->formatToWildFire(
@@ -101,17 +61,6 @@ class WildFirePreQualController
               $applicant->hasCoApplicant()
             );
 
-            // Log success metrics
-            RequestLogger::addMetric('prequal.success', 1, [
-              'bureau' => $preferredBureau,
-              'risk_tier' => $result->getRiskTier()
-            ]);
-
-            RequestLogger::info('WildFire PreQual completed successfully', [
-              'risk_tier' => $result->getRiskTier(),
-              'matched_lenders' => count($result->matchedLenders)
-            ]);
-
             return [
               'success' => true,
               'data' => $wildFireResponse,
@@ -119,26 +68,12 @@ class WildFirePreQualController
             ];
 
         } catch (ValidationException $e) {
-            RequestLogger::error('Validation failed', [
-              'error' => $e->getMessage(),
-              'context' => $e->getContext()
-            ]);
-
-            RequestLogger::addMetric('prequal.validation_error', 1);
-
             return [
               'success' => false,
               'data' => '',
               'error' => $e->getMessage()
             ];
         } catch (AutomationException $e) {
-            RequestLogger::error('Processing failed', [
-              'error' => $e->getMessage(),
-              'context' => $e->getContext()
-            ]);
-
-            RequestLogger::addMetric('prequal.processing_error', 1);
-
             Log::error("WildFire PreQual processing failed: " . $e->getMessage() . "\nContext: " . print_r($e->getContext(), true));
 
             return [
@@ -147,13 +82,6 @@ class WildFirePreQualController
               'error' => 'Processing failed'
             ];
         } catch (\Throwable $e) {
-            RequestLogger::logException($e, [
-              'controller' => 'WildFirePreQualController',
-              'method' => 'handleWildFirePreQual'
-            ]);
-
-            RequestLogger::addMetric('prequal.unexpected_error', 1);
-
             Log::error("Unexpected error in WildFire PreQual: " . $e->getMessage() . "\n" . $e->getTraceAsString());
 
             return [
@@ -170,9 +98,6 @@ class WildFirePreQualController
     public function handleLegacyPull($request): array
     {
         try {
-            // Add breadcrumb for legacy pull
-            RequestLogger::addBreadcrumb('Legacy pull started', [], 'controller');
-
             $requestData = $this->getRequestData($request);
 
             // Extract PII and bureau information
@@ -180,18 +105,10 @@ class WildFirePreQualController
             $pii = $requestData['pii'] ?? [];
             $scoreModel = $requestData['score_model'] ?? 'VANTAGE';
 
-            RequestLogger::setContext('bureau', $bureau);
-            RequestLogger::setContext('score_model', $scoreModel);
-
             // Validate bureau
             $bureau = $this->validateBureau($bureau);
 
             // Build applicant from PII data
-            RequestLogger::addBreadcrumb('Building applicant from PII', [
-              'has_primary' => !empty($pii['primary']),
-              'has_secondary' => !empty($pii['secondary'])
-            ], 'controller');
-
             $applicant = $this->buildApplicantFromPII($pii);
 
             // Process through automation service
@@ -212,12 +129,7 @@ class WildFirePreQualController
                 $automationRequestData['credit_profile'] = $requestData['credit_profile'];
             }
 
-            $startProcess = microtime(true);
             $result = $this->automationService->processPreQual($automationRequestData);
-
-            RequestLogger::addMetric('legacy_pull.duration', (microtime(true) - $startProcess) * 1000, [
-              'bureau' => $bureau
-            ]);
 
             // Format in legacy WildFire format
             $wildFireResponse = $this->wildFireFormatter->formatToWildFire(
@@ -226,11 +138,6 @@ class WildFirePreQualController
               $applicant->hasCoApplicant()
             );
 
-            RequestLogger::info('Legacy pull completed', [
-              'bureau' => $bureau,
-              'has_score' => $result->creditProfile->hasValidScore()
-            ]);
-
             return [
               'success' => true,
               'data' => $wildFireResponse,
@@ -238,11 +145,6 @@ class WildFirePreQualController
             ];
 
         } catch (\Throwable $e) {
-            RequestLogger::logException($e, [
-              'controller' => 'WildFirePreQualController',
-              'method' => 'handleLegacyPull'
-            ]);
-
             Log::error("Legacy pull failed: " . $e->getMessage());
 
             return [
@@ -258,11 +160,6 @@ class WildFirePreQualController
      */
     private function extractOptionalData(array $applicationData, array &$requestData): void
     {
-        RequestLogger::addBreadcrumb('Extracting optional data', [
-          'has_skip_flags' => isset($applicationData['skip_bureau_pull']) || isset($applicationData['skip_valuation']),
-          'has_prepopulated' => isset($applicationData['credit_profile']) || isset($applicationData['vehicle_valuation'])
-        ], 'controller');
-
         // Processing flags
         if (isset($applicationData['skip_bureau_pull'])) {
             $requestData['skip_bureau_pull'] = (bool)$applicationData['skip_bureau_pull'];
@@ -282,17 +179,11 @@ class WildFirePreQualController
         // Pre-populated credit profile
         if (isset($applicationData['credit_profile'])) {
             $requestData['credit_profile'] = $applicationData['credit_profile'];
-            RequestLogger::info('Using pre-populated credit profile', [
-              'has_score' => isset($applicationData['credit_profile']['fico_score'])
-            ]);
         }
 
         // Pre-populated vehicle valuation
         if (isset($applicationData['vehicle_valuation'])) {
             $requestData['vehicle_valuation'] = $applicationData['vehicle_valuation'];
-            RequestLogger::info('Using pre-populated vehicle valuation', [
-              'value' => $applicationData['vehicle_valuation']['value'] ?? 'N/A'
-            ]);
         }
 
         // Additional options for testing/debugging
@@ -326,11 +217,6 @@ class WildFirePreQualController
         ];
 
         if (!isset($bureauMap[$bureau])) {
-            RequestLogger::info('Unknown bureau requested', [
-              'requested' => $bureau,
-              'defaulting_to' => 'experian'
-            ]);
-
             Log::warn("Unknown bureau requested: $bureau, defaulting to Experian");
             return 'experian';
         }
