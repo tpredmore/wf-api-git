@@ -3,6 +3,14 @@
 declare(strict_types=1);
 
 use DI\Container;
+use Psr\Container\ContainerInterface;
+use WF\API\Automation\Events\CreditReportPulledEvent;
+use WF\API\Automation\Events\EventDispatcher;
+use WF\API\Automation\Events\PreQualCompletedEvent;
+use WF\API\Automation\Events\PreQualFailedEvent;
+use WF\API\Automation\Listeners\MetricsCollectorListener;
+use WF\API\Automation\Listeners\MLDataCollectorListener;
+use WF\API\Automation\Services\CreditDataCollectionService;
 use function DI\autowire;
 use function DI\get;
 use function DI\create;
@@ -31,6 +39,10 @@ use WF\API\Automation\Http\Controllers\PreQualController;
 use WF\API\Automation\Http\Controllers\ValuationController;
 use WF\API\Automation\Http\Controllers\HealthController;
 
+function factory(Closure $param) {
+
+}
+
 return [
     // Services
   AutomationService::class => autowire()
@@ -44,7 +56,9 @@ return [
       get(BureauClientFactory::class),
       get(CreditParserFactory::class),
       get(ValuationProviderFactory::class),
-      get(BureauCacheService::class)
+      get(BureauCacheService::class),
+      get(CreditDataCollectionService::class),
+      get(EventDispatcher::class)  // Add this
     ),
 
   RiskScorerInterface::class => autowire(RiskScorer::class)
@@ -125,7 +139,7 @@ return [
       'endpoint' => $_ENV['JDPOWER_ENDPOINT'] ?? ''
     ]),
 
-    // Controllers - No Logger injection needed, they use static Log class
+    // Controllers
   WildFirePreQualController::class => autowire()
     ->constructor(
       get(AutomationService::class),
@@ -141,6 +155,72 @@ return [
   ValuationController::class => autowire()
     ->constructor(
       get(ValuationProviderFactory::class)
+    ),
+
+    // Event Dispatcher with all listeners configured
+  EventDispatcher::class => factory(function (ContainerInterface $container) {
+      $dispatcher = new EventDispatcher(
+        enableAsync: $_ENV['EVENT_ASYNC_ENABLED'] ?? false
+      );
+
+      // ML Data Collection Listener
+      if ($_ENV['ML_COLLECTION_ENABLED'] ?? true) {
+          $mlListener = $container->get(MLDataCollectorListener::class);
+
+          // Register for multiple events
+          $dispatcher->addListener(
+            PreQualCompletedEvent::class,
+            [$mlListener, 'handlePreQualCompleted'],
+            priority: 100 // High priority
+          );
+
+          $dispatcher->addListener(
+            CreditReportPulledEvent::class,
+            [$mlListener, 'handleCreditReportPulled'],
+            priority: 50
+          );
+
+          $dispatcher->addListener(
+            PreQualFailedEvent::class,
+            [$mlListener, 'handlePreQualFailed'],
+            priority: 50
+          );
+      }
+
+      // Metrics Collection Listener
+      if ($_ENV['METRICS_ENABLED'] ?? true) {
+          $metricsListener = $container->get(MetricsCollectorListener::class);
+
+          $dispatcher->addAsyncListener(
+            PreQualCompletedEvent::class,
+            [$metricsListener, 'handlePreQualCompleted']
+          );
+
+          $dispatcher->addAsyncListener(
+            CreditReportPulledEvent::class,
+            [$metricsListener, 'handleCreditReportPulled']
+          );
+      }
+
+      // Add more listeners as needed
+      // Example: Notification listener, Audit listener, etc.
+
+      return $dispatcher;
+  }),
+
+    // ML Data Collector Listener
+  MLDataCollectorListener::class => autowire()
+    ->constructor(
+      get(CreditDataCollectionService::class),
+      $_ENV['ML_COLLECTION_ENABLED'] ?? true,
+      (float)($_ENV['ML_COLLECTION_SAMPLE_RATE'] ?? 1.0)
+    ),
+
+    // Credit Data Collection Service
+  CreditDataCollectionService::class => create()
+    ->constructor(
+      $_ENV['ENCRYPTION_KEY'] ?? 'default-key',
+      $_ENV['ML_DATABASE'] ?? 'wildfire_automation'
     ),
 
   HealthController::class => autowire()

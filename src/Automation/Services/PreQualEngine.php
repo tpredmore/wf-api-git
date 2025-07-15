@@ -16,23 +16,64 @@ use WF\API\Automation\Models\Vehicle;
 use WF\API\Automation\Models\CreditProfile;
 use WF\API\Automation\Models\PreQualResult;
 use WF\API\Automation\Exceptions\AutomationException;
+use WF\API\Automation\Exceptions\ValidationException;
+use WF\API\Automation\Exceptions\BureauApiException;
+use WF\API\Automation\Exceptions\ValuationException;
+use WF\API\Automation\Events\EventDispatcher;
+use WF\API\Automation\Events\PreQualStartedEvent;
+use WF\API\Automation\Events\CreditReportPulledEvent;
+use WF\API\Automation\Events\PreQualCompletedEvent;
+use WF\API\Automation\Events\PreQualFailedEvent;
+use WF\API\Automation\Events\VehicleValuationCompletedEvent;
 use Log;
 
+/**
+ * Main engine for processing pre-qualification requests
+ * Orchestrates credit pulls, valuations, and risk scoring
+ */
 class PreQualEngine implements PreQualEngineInterface
 {
+    /**
+     * @param RiskScorerInterface $riskScorer Risk scoring service
+     * @param BureauClientFactory $bureauFactory Factory for creating bureau clients
+     * @param CreditParserFactory $parserFactory Factory for creating credit parsers
+     * @param ValuationProviderFactory $valuationFactory Factory for valuation providers
+     * @param BureauCacheService $cacheService Cache service for bureau responses
+     * @param EventDispatcher|null $eventDispatcher Optional event dispatcher for decoupled operations
+     */
     public function __construct(
       private RiskScorerInterface $riskScorer,
       private BureauClientFactory $bureauFactory,
       private CreditParserFactory $parserFactory,
       private ValuationProviderFactory $valuationFactory,
-      private BureauCacheService $cacheService
+      private BureauCacheService $cacheService,
+      private ?EventDispatcher $eventDispatcher = null
     ) {}
 
     /**
-     * @throws AutomationException
+     * Evaluate pre-qualification for an applicant and vehicle
+     *
+     * @param Applicant $applicant The applicant information
+     * @param Vehicle $vehicle The vehicle information
+     * @param array $additionalData Additional processing options:
+     *   - preferred_bureau: string (default: 'experian')
+     *   - use_cache: bool (default: true)
+     *   - skip_bureau_pull: bool (default: false)
+     *   - skip_valuation: bool (default: false)
+     *   - credit_profile: array|null Pre-populated credit data
+     *   - vehicle_valuation: array|null Pre-populated valuation data
+     *   - request_id: string Unique request identifier
+     *   - metadata: array Additional metadata
+     *
+     * @return PreQualResult The evaluation result
+     * @throws AutomationException If evaluation fails
      */
     public function evaluate(Applicant $applicant, Vehicle $vehicle, array $additionalData = []): PreQualResult
     {
+        $startTime = microtime(true);
+        $requestId = $additionalData['request_id'] ?? uniqid('pq_', true);
+
+        // Extract processing options
         $bureau = $additionalData['preferred_bureau'] ?? 'experian';
         $useCache = $additionalData['use_cache'] ?? true;
         $skipBureauPull = $additionalData['skip_bureau_pull'] ?? false;
@@ -40,12 +81,34 @@ class PreQualEngine implements PreQualEngineInterface
         $providedCreditProfile = $additionalData['credit_profile'] ?? null;
         $providedValuation = $additionalData['vehicle_valuation'] ?? null;
 
-        // Track if we used cache
-        $fromCache = false;
+        // Build event metadata
+        $eventMetadata = array_merge($additionalData['metadata'] ?? [], [
+          'request_id' => $requestId,
+          'source' => $additionalData['source'] ?? 'api',
+          'user' => $_SERVER['HTTP_X_GRAVITY_USER'] ?? 'system',
+          'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+          'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? ''
+        ]);
+
+        // Dispatch start event
+        $this->dispatch(new PreQualStartedEvent(
+          $applicant,
+          $vehicle,
+          $bureau,
+          $eventMetadata
+        ));
+
+        Log::info("Starting pre-qualification evaluation", [
+          'request_id' => $requestId,
+          'applicant' => $applicant->getFullName(),
+          'bureau' => $bureau,
+          'skip_bureau' => $skipBureauPull,
+          'skip_valuation' => $skipValuation
+        ]);
 
         try {
-            // Step 1: Get credit profile (from provided data, cache, or bureau)
-            $result = $this->getCreditProfile(
+            // Step 1: Get credit profile
+            $creditResult = $this->getCreditProfile(
               $applicant,
               $bureau,
               $useCache,
@@ -53,14 +116,29 @@ class PreQualEngine implements PreQualEngineInterface
               $providedCreditProfile
             );
 
-            $creditProfile = $result['profile'];
-            $fromCache = $result['from_cache'];
+            $creditProfile = $creditResult['profile'];
+            $fromCache = $creditResult['from_cache'];
+
+            // Dispatch credit report event if we have a hit
+            if ($creditProfile->hasHit) {
+                $this->dispatch(new CreditReportPulledEvent(
+                  $applicant,
+                  $creditProfile,
+                  $bureau,
+                  $fromCache,
+                  array_merge($eventMetadata, [
+                    'pull_time' => microtime(true) - $startTime,
+                    'has_score' => $creditProfile->hasValidScore()
+                  ])
+                ));
+            }
 
             // Step 2: Get vehicle with valuation
             $vehicleWithValue = $this->getVehicleWithValuation(
               $vehicle,
               $skipValuation,
-              $providedValuation
+              $providedValuation,
+              $eventMetadata
             );
 
             // Step 3: Calculate risk score and match lenders
@@ -72,7 +150,20 @@ class PreQualEngine implements PreQualEngineInterface
             $isComplete = $this->isResultComplete($creditProfile, $applicant, $vehicleWithValue);
             $missingReason = $isComplete ? null : $this->getMissingReason($creditProfile, $applicant, $vehicleWithValue);
 
-            return new PreQualResult(
+            // Step 5: Build result metadata
+            $resultMetadata = [
+              'bureau_used' => $bureau,
+              'score_factors' => $this->riskScorer->getScoreFactors(),
+              'processing_time' => microtime(true) - $startTime,
+              'from_cache' => $fromCache,
+              'skipped_bureau_pull' => $skipBureauPull,
+              'skipped_valuation' => $skipValuation,
+              'request_id' => $requestId,
+              'has_co_applicant' => $applicant->hasCoApplicant()
+            ];
+
+            // Step 6: Create result
+            $result = new PreQualResult(
               approvalScore: $isComplete ? $riskScore : 0.0,
               riskTier: $isComplete ? $riskTier : 'manual_review',
               matchedLenders: $isComplete ? $matchedLenders : [],
@@ -81,26 +172,62 @@ class PreQualEngine implements PreQualEngineInterface
               creditProfile: $creditProfile,
               ltv: $vehicleWithValue->calculateLTV(),
               dti: $applicant->calculateDTI($creditProfile->estimatedMonthlyDebt),
-              metadata: [
-                'bureau_used' => $bureau,
-                'score_factors' => $this->riskScorer->getScoreFactors(),
-                'processing_time' => microtime(true) - ($_SERVER['REQUEST_TIME_FLOAT'] ?? 0),
-                'from_cache' => $fromCache,
-                'skipped_bureau_pull' => $skipBureauPull,
-                'skipped_valuation' => $skipValuation
-              ]
+              metadata: $resultMetadata
             );
 
+            // Dispatch completion event
+            $this->dispatch(new PreQualCompletedEvent(
+              $applicant,
+              $vehicleWithValue,
+              $creditProfile,
+              $result,
+              array_merge($eventMetadata, [
+                'processing_time' => microtime(true) - $startTime,
+                'completed_at' => date('Y-m-d H:i:s')
+              ])
+            ));
+
+            Log::info("Pre-qualification evaluation completed", [
+              'request_id' => $requestId,
+              'is_approved' => $result->isApproved(),
+              'risk_tier' => $result->getRiskTier(),
+              'processing_time' => microtime(true) - $startTime
+            ]);
+
+            return $result;
+
         } catch (\Throwable $e) {
-            Log::error("PreQual engine evaluation failed: " . $e->getMessage());
-            throw new AutomationException('Failed to evaluate pre-qualification', 0, $e);
+            // Dispatch failure event
+            $this->dispatch(new PreQualFailedEvent(
+              $applicant,
+              $vehicle,
+              $e->getMessage(),
+              $e,
+              array_merge($eventMetadata, [
+                'processing_time' => microtime(true) - $startTime,
+                'failed_at' => date('Y-m-d H:i:s')
+              ])
+            ));
+
+            Log::error("PreQual engine evaluation failed", [
+              'request_id' => $requestId,
+              'error' => $e->getMessage(),
+              'trace' => $e->getTraceAsString()
+            ]);
+
+            throw new AutomationException(
+              'Failed to evaluate pre-qualification: ' . $e->getMessage(),
+              0,
+              $e,
+              ['request_id' => $requestId]
+            );
         }
     }
 
     /**
      * Get credit profile from provided data, cache, or bureau
-     * Returns array with profile and cache flag
      *
+     * @return array{profile: CreditProfile, from_cache: bool}
      * @throws AutomationException
      */
     private function getCreditProfile(
@@ -120,17 +247,28 @@ class PreQualEngine implements PreQualEngineInterface
             }
 
             // If it's an array, convert to CreditProfile
-            return [
-              'profile' => CreditProfile::fromArray($providedCreditProfile),
-              'from_cache' => false
-            ];
+            try {
+                $profile = CreditProfile::fromArray($providedCreditProfile);
+                return ['profile' => $profile, 'from_cache' => false];
+            } catch (\Exception $e) {
+                Log::warn("Failed to parse provided credit profile: " . $e->getMessage());
+                throw new ValidationException("Invalid credit profile data provided");
+            }
         }
 
         // Option 2: Check cache if enabled
         if ($useCache && !empty($applicant->ssn)) {
+            Log::debug("Checking cache for credit profile", [
+              'bureau' => $bureau,
+              'ssn_suffix' => substr($applicant->ssn, -4)
+            ]);
+
             $cachedProfile = $this->cacheService->get($applicant->ssn, $bureau);
             if ($cachedProfile !== null) {
-                Log::info("Using cached credit profile for bureau: $bureau");
+                Log::info("Using cached credit profile", [
+                  'bureau' => $bureau,
+                  'cached_at' => $cachedProfile->pulledAt
+                ]);
                 return ['profile' => $cachedProfile, 'from_cache' => true];
             }
         }
@@ -145,11 +283,17 @@ class PreQualEngine implements PreQualEngineInterface
         }
 
         // Option 4: Pull from bureau
+        Log::info("Pulling credit report from bureau", ['bureau' => $bureau]);
         $creditProfile = $this->pullCreditReport($applicant, $bureau);
 
-        // Cache the result if enabled
+        // Cache the result if enabled and we got a hit
         if ($useCache && !empty($applicant->ssn) && $creditProfile->hasHit) {
-            $this->cacheService->set($applicant->ssn, $bureau, $creditProfile);
+            try {
+                $this->cacheService->set($applicant->ssn, $bureau, $creditProfile);
+                Log::debug("Cached credit profile", ['bureau' => $bureau]);
+            } catch (\Exception $e) {
+                Log::warn("Failed to cache credit profile: " . $e->getMessage());
+            }
         }
 
         return ['profile' => $creditProfile, 'from_cache' => false];
@@ -158,15 +302,17 @@ class PreQualEngine implements PreQualEngineInterface
     /**
      * Get vehicle with valuation
      *
-     * @throws \WF\API\Automation\Exceptions\ValidationException
+     * @throws ValidationException|\WF\API\Automation\Exceptions\AutomationException
      */
     private function getVehicleWithValuation(
       Vehicle $vehicle,
       bool $skipValuation,
-      ?array $providedValuation
+      ?array $providedValuation,
+      array $eventMetadata = []
     ): Vehicle {
         // If vehicle already has value, return as-is
         if ($vehicle->vehicleValue !== null && $vehicle->vehicleValue > 0) {
+            Log::debug("Vehicle already has value", ['value' => $vehicle->vehicleValue]);
             return $vehicle;
         }
 
@@ -174,8 +320,9 @@ class PreQualEngine implements PreQualEngineInterface
         if ($providedValuation !== null) {
             $value = $providedValuation['value'] ?? $providedValuation['vehicle_value'] ?? 0;
             if ($value > 0) {
-                Log::info("Using provided vehicle valuation: $value");
-                return new Vehicle(
+                Log::info("Using provided vehicle valuation", ['value' => $value]);
+
+                $vehicleWithValue = new Vehicle(
                   vin: $vehicle->vin,
                   year: $vehicle->year,
                   make: $vehicle->make,
@@ -185,6 +332,16 @@ class PreQualEngine implements PreQualEngineInterface
                   vehicleValue: (float)$value,
                   condition: $vehicle->condition
                 );
+
+                // Dispatch valuation event with provided data
+                $this->dispatch(new VehicleValuationCompletedEvent(
+                  $vehicleWithValue,
+                  $providedValuation,
+                  'provided',
+                  array_merge($eventMetadata, ['source' => 'provided'])
+                ));
+
+                return $vehicleWithValue;
             }
         }
 
@@ -195,7 +352,142 @@ class PreQualEngine implements PreQualEngineInterface
         }
 
         // Otherwise, get valuation from provider
-        return $this->getVehicleValuation($vehicle);
+        Log::info("Getting vehicle valuation", [
+          'vin' => substr($vehicle->vin, 0, 8) . '...',
+          'mileage' => $vehicle->mileage
+        ]);
+
+        try {
+            $provider = $this->valuationFactory->createBest();
+            $valuationData = $provider->getValuation(
+              $vehicle->vin,
+              $vehicle->mileage,
+              '', // ZIP code - could be passed in eventMetadata
+              $vehicle->condition
+            );
+
+            $vehicleWithValue = new Vehicle(
+              vin: $vehicle->vin,
+              year: $vehicle->year,
+              make: $vehicle->make,
+              model: $vehicle->model,
+              mileage: $vehicle->mileage,
+              loanAmount: $vehicle->loanAmount,
+              vehicleValue: (float)$valuationData['value'],
+              condition: $vehicle->condition
+            );
+
+            // Dispatch valuation completed event
+            $this->dispatch(new VehicleValuationCompletedEvent(
+              $vehicleWithValue,
+              $valuationData,
+              $provider->getProviderName(),
+              array_merge($eventMetadata, ['source' => 'api'])
+            ));
+
+            Log::info("Vehicle valuation completed", [
+              'provider' => $provider->getProviderName(),
+              'value' => $valuationData['value']
+            ]);
+
+            return $vehicleWithValue;
+
+        } catch (ValuationException $e) {
+            Log::error("Vehicle valuation failed: " . $e->getMessage());
+            throw new AutomationException("Failed to get vehicle valuation", 0, $e);
+        }
+    }
+
+    /**
+     * Pull credit report from bureau
+     *
+     * @throws AutomationException
+     */
+    private function pullCreditReport(Applicant $applicant, string $bureau): CreditProfile
+    {
+        try {
+            $client = $this->bureauFactory->create($bureau);
+            $parser = $this->parserFactory->create($bureau);
+        } catch (NotFoundExceptionInterface|ContainerExceptionInterface|AutomationException $e) {
+            Log::error("Failed to create bureau client or parser", [
+              'bureau' => $bureau,
+              'error' => $e->getMessage()
+            ]);
+            throw new AutomationException("Bureau service unavailable: $bureau", 0, $e);
+        }
+
+        // Build consumer data array
+        $consumers = [$this->buildConsumerData($applicant)];
+
+        // Add co-applicant if present
+        if ($applicant->hasCoApplicant()) {
+            $coApp = $applicant->coApplicant;
+            $consumers[] = [
+              'firstName' => $coApp['first_name'],
+              'lastName' => $coApp['last_name'],
+              'middleName' => $coApp['middle_name'] ?? '',
+              'ssn' => $coApp['ssn'],
+              'address' => $coApp['address'],
+              'city' => $coApp['city'],
+              'state' => $coApp['state'],
+              'zip' => $coApp['zip'],
+              'dob' => $coApp['dob'],
+            ];
+        }
+
+        try {
+            Log::debug("Pulling credit report", [
+              'bureau' => $bureau,
+              'consumer_count' => count($consumers)
+            ]);
+
+            $rawResponse = $client->pullCreditReport($consumers);
+            $creditProfile = $parser->parse($rawResponse);
+
+            Log::info("Credit report pulled successfully", [
+              'bureau' => $bureau,
+              'has_score' => $creditProfile->hasValidScore(),
+              'score' => $creditProfile->ficoScore
+            ]);
+
+            return $creditProfile;
+
+        } catch (BureauApiException $e) {
+            Log::error("Bureau API error", [
+              'bureau' => $bureau,
+              'error' => $e->getMessage()
+            ]);
+            throw new AutomationException("Credit bureau error: " . $e->getMessage(), 0, $e);
+        } catch (\Exception $e) {
+            Log::error("Unexpected error pulling credit", [
+              'bureau' => $bureau,
+              'error' => $e->getMessage()
+            ]);
+            throw new AutomationException("Failed to pull credit report", 0, $e);
+        }
+    }
+
+    /**
+     * Build consumer data for bureau request
+     */
+    private function buildConsumerData(Applicant $applicant): array
+    {
+        $middleName = '';
+        if (property_exists($applicant, 'middleName')) {
+            $middleName = $applicant->middleName;
+        }
+
+        return [
+          'firstName' => $applicant->firstName,
+          'lastName' => $applicant->lastName,
+          'middleName' => $middleName,
+          'ssn' => $applicant->ssn,
+          'address' => $applicant->address,
+          'city' => $applicant->city,
+          'state' => $applicant->state,
+          'zip' => $applicant->zipCode,
+          'dob' => $applicant->dateOfBirth,
+        ];
     }
 
     /**
@@ -225,102 +517,77 @@ class PreQualEngine implements PreQualEngineInterface
      */
     private function matchLenders(Applicant $applicant, Vehicle $vehicle, CreditProfile $credit): array
     {
-        // RiskScorer already has this method, but it's not in the interface
-        // For now, we'll use a simple implementation
+        // Check if RiskScorer has matchLenders method
         if (method_exists($this->riskScorer, 'matchLenders')) {
             return $this->riskScorer->matchLenders($applicant, $vehicle, $credit);
         }
 
-        // Default implementation
+        // Default implementation if method doesn't exist
+        Log::warn("RiskScorer doesn't implement matchLenders method");
         return [];
     }
 
     /**
-     * @throws AutomationException
+     * Check if result is complete
      */
-    private function pullCreditReport(Applicant $applicant, string $bureau): CreditProfile
+    private function isResultComplete(CreditProfile $credit, Applicant $applicant, Vehicle $vehicle): bool
     {
-        try {
-            $client = $this->bureauFactory->create($bureau);
-        } catch (NotFoundExceptionInterface|ContainerExceptionInterface|AutomationException $e) {
-            Log::error("Loading bureau client factory failed: " . $e->getMessage());
-            throw new AutomationException('Failed to loading bureau client factory', 0, $e);
+        // Must have valid credit score
+        if (!$credit->hasValidScore()) {
+            Log::debug("Result incomplete: no valid credit score");
+            return false;
         }
 
-        $parser = $this->parserFactory->create($bureau);
-
-        // Add middleName property to Applicant model or handle it here
-        $middleName = '';
-        if (property_exists($applicant, 'middleName')) {
-            $middleName = $applicant->middleName;
+        // Must have income
+        if ($applicant->monthlyIncome <= 0) {
+            Log::debug("Result incomplete: no monthly income");
+            return false;
         }
 
-        $consumers = [
-          [
-            'firstName' => $applicant->firstName,
-            'lastName' => $applicant->lastName,
-            'middleName' => $middleName,
-            'ssn' => $applicant->ssn,
-            'address' => $applicant->address,
-            'city' => $applicant->city,
-            'state' => $applicant->state,
-            'zip' => $applicant->zipCode,
-            'dob' => $applicant->dateOfBirth,
-          ]
-        ];
-
-        if ($applicant->hasCoApplicant()) {
-            $coApp = $applicant->coApplicant;
-            $consumers[] = [
-              'firstName' => $coApp['first_name'],
-              'lastName' => $coApp['last_name'],
-              'middleName' => $coApp['middle_name'] ?? '',
-              'ssn' => $coApp['ssn'],
-              'address' => $coApp['address'],
-              'city' => $coApp['city'],
-              'state' => $coApp['state'],
-              'zip' => $coApp['zip'],
-              'dob' => $coApp['dob'],
-            ];
+        // Must have vehicle value for LTV calculation
+        if ($vehicle->vehicleValue === null || $vehicle->vehicleValue <= 0) {
+            Log::debug("Result incomplete: no vehicle value");
+            return false;
         }
 
-        $rawResponse = $client->pullCreditReport($consumers);
-        return $parser->parse($rawResponse);
+        return true;
     }
 
     /**
-     * @throws \WF\API\Automation\Exceptions\ValuationException
-     * @throws \WF\API\Automation\Exceptions\ValidationException
+     * Get reason why result is not complete
      */
-    private function getVehicleValuation(Vehicle $vehicle): Vehicle
-    {
-        $provider = $this->valuationFactory->createBest();
-        $valuation = $provider->getValuation($vehicle->vin, $vehicle->mileage, '', $vehicle->condition);
-
-        return new Vehicle(
-          vin: $vehicle->vin,
-          year: $vehicle->year,
-          make: $vehicle->make,
-          model: $vehicle->model,
-          mileage: $vehicle->mileage,
-          loanAmount: $vehicle->loanAmount,
-          vehicleValue: (float)$valuation['value'],
-          condition: $vehicle->condition
-        );
-    }
-
-    private function isResultComplete(CreditProfile $credit, Applicant $applicant, Vehicle $vehicle): bool
-    {
-        return $credit->hasValidScore()
-          && $applicant->monthlyIncome > 0
-          && $vehicle->vehicleValue > 0;
-    }
-
     private function getMissingReason(CreditProfile $credit, Applicant $applicant, Vehicle $vehicle): string
     {
-        if (!$credit->hasValidScore()) return 'missing_fico';
-        if ($applicant->monthlyIncome <= 0) return 'missing_income';
-        if ($vehicle->vehicleValue <= 0) return 'missing_vehicle_value';
+        if (!$credit->hasValidScore()) {
+            return 'missing_fico';
+        }
+
+        if ($applicant->monthlyIncome <= 0) {
+            return 'missing_income';
+        }
+
+        if ($vehicle->vehicleValue === null || $vehicle->vehicleValue <= 0) {
+            return 'missing_vehicle_value';
+        }
+
         return 'unknown';
+    }
+
+    /**
+     * Dispatch event if dispatcher is available
+     */
+    private function dispatch(object $event): void
+    {
+        if ($this->eventDispatcher !== null) {
+            try {
+                $this->eventDispatcher->dispatch($event);
+            } catch (\Exception $e) {
+                // Log but don't fail the main process
+                Log::error("Event dispatch failed", [
+                  'event' => get_class($event),
+                  'error' => $e->getMessage()
+                ]);
+            }
+        }
     }
 }

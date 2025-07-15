@@ -7,13 +7,13 @@ return [
       'get'
     ],
 
-      // Health check for new services
+      // Health check for new services WIP
     'api/health' => [
       '\WF\API\Automation\Http\Controllers\HealthController',
       'check'
     ],
 
-      // API documentation endpoint
+      // API documentation endpoint ?? Do we need something like this?
     'api/docs' => function($requestData, $params) {
         return [
           'success' => true,
@@ -87,22 +87,6 @@ return [
     'api/automation/rates' => [
       '\WF\API\Automation\Http\Controllers\RateController',
       'findRates'
-    ],
-
-      // =====================================================
-      // Administrative Routes
-      // =====================================================
-
-      // Lender management
-    'api/automation/lenders' => [
-      '\WF\API\Automation\Http\Controllers\LenderController',
-      'manageLenders'
-    ],
-
-      // Configuration management
-    'api/automation/config' => [
-      '\WF\API\Automation\Http\Controllers\ConfigController',
-      'updateConfig'
     ]
   ]
 ];
