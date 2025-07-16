@@ -11,7 +11,6 @@ use WF\API\Automation\Models\PreQualResult;
 use WF\API\Automation\Models\CreditProfile;
 use WF\API\Automation\Exceptions\ValidationException;
 use WF\API\Automation\Exceptions\AutomationException;
-use WF\API\Automation\Exceptions\RateLimitException;
 use WF\API\Automation\Services\BureauCacheService;
 use WF\API\Automation\Factories\BureauClientFactory;
 use WF\API\Automation\Factories\CreditParserFactory;
@@ -27,8 +26,6 @@ use Log;
  */
 class AutomationService
 {
-    private array $rateLimits;
-    private bool $enableRateLimiting;
     private bool $enableRequestValidation;
 
     /**
@@ -47,12 +44,6 @@ class AutomationService
       private ?EventDispatcher $eventDispatcher = null,
       array $config = []
     ) {
-        $this->rateLimits = $config['rate_limits'] ?? [
-          'per_minute' => 60,
-          'per_hour' => 1000,
-          'per_day' => 10000
-        ];
-        $this->enableRateLimiting = $config['enable_rate_limiting'] ?? false;
         $this->enableRequestValidation = $config['enable_validation'] ?? true;
     }
 
@@ -76,11 +67,6 @@ class AutomationService
         ));
 
         try {
-            // Check rate limits
-            if ($this->enableRateLimiting) {
-                $this->checkRateLimit($requestData['user_id'] ?? 'anonymous');
-            }
-
             // Validate request data
             if ($this->enableRequestValidation) {
                 $this->validatePreQualRequest($requestData);
@@ -507,30 +493,6 @@ class AutomationService
               $errors
             );
         }
-    }
-
-    /**
-     * Check rate limits
-     *
-     * @throws RateLimitException
-     */
-    private function checkRateLimit(string $userId): void
-    {
-        $key = "rate_limit:{$userId}";
-
-        // Check per-minute limit
-        $minuteKey = "{$key}:minute:" . date('Y-m-d-H-i');
-        $minuteCount = (int)Cache::get($minuteKey) ?: 0;
-
-        if ($minuteCount >= $this->rateLimits['per_minute']) {
-            throw new RateLimitException('Rate limit exceeded: per minute');
-        }
-
-        // Increment counters
-        Cache::incr($minuteKey);
-        Cache::expire($minuteKey, 60);
-
-        // Similar checks for hourly and daily limits...
     }
 
     /**
