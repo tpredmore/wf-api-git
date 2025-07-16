@@ -11,10 +11,12 @@ use Log;
 
 class CreditDataCollectionService
 {
+    private string $encryptionKey;
     private string $database;
 
-    public function __construct(string $database = 'wildfire_automation')
+    public function __construct(string $encryptionKey, string $database = 'wildfire_automation')
     {
+        $this->encryptionKey = $encryptionKey;
         $this->database = $database;
     }
 
@@ -72,7 +74,7 @@ class CreditDataCollectionService
           $applicant->middleName ?? '',
           $applicant->dateOfBirth,
           $gender,
-       //   $this->encryptionKey,
+          $this->encryptionKey,
           $_SERVER['HTTP_X_GRAVITY_USER'] ?? 'system',
           $_SERVER['REMOTE_ADDR'] ?? ''
         ];
